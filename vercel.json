@@ -1,18 +1,14 @@
 {
-    "version": 2,
-    "builds": [
-        {
-            "src": "api/webhook.py",
-            "use": "@vercel/python"
+    "$schema": "https://openapi.vercel.sh/vercel.json",
+    "functions": {
+        "api/webhook.py": {
+            "maxDuration": 30
         }
-    ],
+    },
     "routes": [
         {
             "src": "/api/webhook",
             "dest": "api/webhook.py"
         }
-    ],
-    "env": {
-        "PYTHON_VERSION": "3.11"
-    }
+    ]
 }

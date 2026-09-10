@@ -1,12 +1,17 @@
 # Multilink Bot (Python Version)
 
-A Telegram bot that parses music links from Spotify, Yandex Music, and MTS Music, providing track information.
+A Telegram bot that parses music links from Spotify, Yandex Music, and MTS Music,
+finds the same track in the other services and replies with multi-links.
 
 ## Features
 
-- Parse links from Spotify, Yandex Music, and MTS Music
-- Extract track title and artist information
-- Send formatted responses in Markdown
+- Parse track links from Spotify, Yandex Music, and MTS Music
+- Search the same track in other services (Spotify, Yandex Music)
+- Fuzzy track matching: the bot verifies that the found track is really the
+  same one (title + artists) before giving a direct link; otherwise it falls
+  back to a search link
+- Inline mode support
+- Deploys as a Vercel serverless function (warm-safe) or runs locally via polling
 
 ## Setup
 
@@ -14,48 +19,56 @@ A Telegram bot that parses music links from Spotify, Yandex Music, and MTS Music
 
 1. Clone the repository
 2. Install dependencies: `pip install -r requirements.txt`
-3. Copy `.env.example` to `.env` and add your Telegram bot token
+3. Copy `.env.example` to `.env` and fill in your tokens
 4. Run the bot: `python main.py`
+
+### Run Tests
+
+```
+pip install -r requirements.txt -r test_requirements.txt
+pytest
+```
 
 ### Deploy to Vercel
 
 1. **Push your code to GitHub/GitLab/Bitbucket**
-   - Убедитесь, что все файлы закоммичены и запушены в репозиторий
 
-2. **Создайте проект на Vercel**
-   - Перейдите на [vercel.com](https://vercel.com)
-   - Войдите через ваш Git-провайдер
-   - Нажмите "Add New Project" и выберите ваш репозиторий
+2. **Create a project on Vercel**
+   - Go to [vercel.com](https://vercel.com), sign in via your Git provider
+   - "Add New Project" and select your repository
 
-3. **Настройте переменные окружения в Vercel**
-   - В настройках проекта перейдите в "Environment Variables"
-   - Добавьте следующие переменные:
-     - `TELEGRAM_TOKEN` - токен вашего Telegram бота
-     - `SPOTIFY_CLIENT_ID` - ID клиента Spotify (если используется)
-     - `SPOTIFY_CLIENT_SECRET` - секрет клиента Spotify (если используется)
-     - `YANDEX_MUSIC_TOKEN` - токен Yandex Music (если используется)
-     - `MTS_VK_TOKEN` - токен VK API для MTS Music (если используется)
+3. **Configure environment variables**
+   - `TELEGRAM_TOKEN` — your Telegram bot token (required)
+   - `YANDEX_MUSIC_TOKEN` — Yandex Music token (for parsing/searching Yandex tracks)
+   - `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — Spotify app credentials (for Spotify search)
+   - `WEBHOOK_SECRET` — secret string checked against the
+     `X-Telegram-Bot-Api-Secret-Token` header (recommended)
+   - `MTS_VK_TOKEN` is no longer used: VK audio search returned only
+     short-lived mp3 stream URLs, so MTS links always point to the MTS search page
 
-4. **Деплой**
-   - Vercel автоматически определит настройки из `vercel.json`
-   - Нажмите "Deploy" и дождитесь завершения
+4. **Deploy**
+   - Vercel picks up the configuration from `vercel.json`
+   - The function runs on Python 3.12 (`runtime.txt`), `maxDuration` is 30 s
 
-5. **Настройте Webhook в Telegram**
-   - После деплоя получите URL вашего проекта (например: `https://your-project.vercel.app`)
-   - Установите webhook через Telegram Bot API:
-     ```
-     https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://your-project.vercel.app/api/webhook
-     ```
-   - Проверьте статус webhook:
+5. **Set the Telegram webhook**
+   ```
+   https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://your-project.vercel.app/api/webhook&secret_token=<WEBHOOK_SECRET>
+   ```
+   - Check webhook status:
      ```
      https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo
      ```
 
-**Важно:** После каждого деплоя URL может измениться, если вы не используете кастомный домен. Обновите webhook URL в Telegram.
+**Note:** after each deploy the project URL may change unless you use a custom
+domain — update the webhook URL in Telegram accordingly.
 
 ## Project Structure
 
-- `src/config/` - Configuration constants
-- `src/services/` - Business logic services
-- `src/utils/` - Utility functions
-- `src/handlers/` - Message handlers for the bot
+- `src/config/` — `constants.py` with service definitions
+- `src/clients.py` — process-cached API clients (Yandex Music, Spotify)
+- `src/link_parser.py` — per-service link parsing (title/artist extraction)
+- `src/link_finder.py` — cross-service track search
+- `src/matching.py` — fuzzy "is it the same track?" verification
+- `src/message_handler.py` — Telegram update handlers
+- `api/webhook.py` — Vercel serverless webhook endpoint
+- `tests/` — pytest suite (run with `pytest`)

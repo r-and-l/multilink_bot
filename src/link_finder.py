@@ -1,183 +1,177 @@
-import os
-from .constants import SERVICES
+"""Поиск трека в остальных сервисах: по данным одного сервиса строим ссылки
+на этот же трек в других."""
+import asyncio
+import logging
+import urllib.parse
 from abc import ABC, abstractmethod
-from .logger import log_async_method
+
+from .clients import get_spotify_client, get_yandex_client
+from .constants import SERVICES
+from .matching import is_same_track, pick_best_match
+
+logger = logging.getLogger(__name__)
+
+
+def _search_url(base, track_info):
+    """URL страницы поиска с закодированным запросом «артист - название»."""
+    query = urllib.parse.quote(f"{track_info['artists']} - {track_info['title']}")
+    return f'{base}search?text={query}'
+
+
+def _spotify_search_url(track_info):
+    """Рабочий формат поиска Spotify: /search/<запрос>, не ?text=."""
+    query = urllib.parse.quote(f"{track_info['artists']} {track_info['title']}")
+    return f'https://open.spotify.com/search/{query}'
+
 
 class Finder(ABC):
-    """Абстрактный базовый класс для парсеров"""
-    
+    """Базовый класс поиска трека в стороннем сервисе"""
+
     def __init__(self, service_info):
         self.service = service_info
-    
+
     @abstractmethod
     async def find(self, track_info):
-        """Ищет ссылку и возвращает данные о треке"""
-        pass
+        """Возвращает dict {'service': str, 'url': str | None}."""
+        raise NotImplementedError
+
 
 class SpotifyFinder(Finder):
-    @log_async_method
-    async def find(self, track_info):
-        try:
-            import spotipy
-            from spotipy.oauth2 import SpotifyClientCredentials
-            
-            client_credentials_manager = SpotifyClientCredentials(
-                client_id=os.getenv("SPOTIFY_CLIENT_ID"),
-                client_secret=os.getenv("SPOTIFY_CLIENT_SECRET")
-            )
-            sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
-            
-            query = f"{track_info['artists']} - {track_info['title']}"
-            results = sp.search(q=query, type='track', limit=1)
-            items = results.get('tracks', {}).get('items', [])
-            
-            if items:
-                track = items[0]
-                url = track['external_urls']['spotify']
-                
-                return {
-                    'service': self.service['name'],
-                    'url': url,
-                }
-            return {
-                'service': self.service['name'],
-                'url': None,
-            }
-        except Exception as e:
-            print(f"Error Finding Spotify: {e}")
-            return {
-                'url': None,
-                'error': str(e),
-                'service': self.service['name'],
-            }
-    
-class YandexFinder(Finder):
-    @log_async_method
-    async def find(self, track_info):
-        try:
-            from yandex_music import Client
-            import urllib.parse
-            
-            token = os.getenv("YANDEX_MUSIC_TOKEN")
-            if not token:
-                # Если токен не установлен, возвращаем ссылку на поиск
-                track_name = f"{track_info['artists']} - {track_info['title']}"
-                return {
-                    'service': self.service['name'],
-                    'url': f'https://music.yandex.ru/search?text={urllib.parse.quote(track_name)}',
-                }
-            
-            client = Client(token).init()
-            track_name = f"{track_info['artists']} - {track_info['title']}"
-            
-            try:
-                search_result = client.search(track_name, type_='track', page=0, playlist_in_best=True)
-                
-                # Пытаемся найти трек в результатах поиска
-                if search_result and search_result.tracks:
-                    tracks = search_result.tracks.results
-                    if tracks:
-                        # Берем первый результат
-                        track = tracks[0]
-                        if track and track.albums:
-                            url = f"https://music.yandex.ru/album/{track.albums[0].id}/track/{track.id}"
-                            return {
-                                'service': self.service['name'],
-                                'url': url,
-                            }
-                
-                # Если не нашли через tracks, пробуем через best
-                if search_result.best:
-                    try:
-                        type_ = search_result.best.type
-                        if type_ == 'track':
-                            best = search_result.best.result
-                            if best and best.albums:
-                                url = f"https://music.yandex.ru/album/{best.albums[0].id}/track/{best.id}"
-                                return {
-                                    'service': self.service['name'],
-                                    'url': url,
-                                }
-                    except Exception as best_error:
-                        print(f"Error processing best result: {best_error}")
-                        # Продолжаем выполнение
-                        pass
-                        
-            except Exception as search_error:
-                print(f"Error in Yandex search: {search_error}")
-                # Возвращаем ссылку на поиск при ошибке
-                pass
+    def _search_sync(self, track_info):
+        """Синхронный поиск через Spotify Web API; вызывается через to_thread.
 
-            # Если ничего не нашли, возвращаем ссылку на поиск
-            return {
-                'service': self.service['name'],
-                'url': f'https://music.yandex.ru/search?text={urllib.parse.quote(track_name)}',
-            }
-        except Exception as e:
-            print(f"Error Finding Yandex: {e}")
-            import traceback
-            traceback.print_exc()
-            # При любой ошибке возвращаем ссылку на поиск вместо None
-            track_name = f"{track_info['artists']} - {track_info['title']}"
-            import urllib.parse
-            return {
-                'service': self.service['name'],
-                'url': f'https://music.yandex.ru/search?text={urllib.parse.quote(track_name)}',
-                'error': str(e),
-            }
-        
-class MTSFinder(Finder):
-    @log_async_method
-    async def find(self, track_info):
-        try:
-            from vk_api import VkApi
-            vk_session = VkApi(token=os.getenv("MTS_VK_TOKEN"))
-            vk = vk_session.get_api()
-            
-            search_result = vk.audio.search(q=f"{track_info['artists']} - {track_info['title']}", count=1)
-            if search_result['items']:
-                track = search_result['items'][0]
-                url = track.get('url')
-                print(f"Found MTS track URL: {url}, {track}")
-                return {
-                    'service': self.service['name'],
-                    'url': url,
+        Строим field-фильтры artist:/track: — они дают заметно точнее
+        выдачу, чем сырой запрос «артист - название». Убираем оскорбительный
+        для Spotify синтаксис «feat», который ломает фильтры.
+        """
+        sp = get_spotify_client()
+        if sp is None:
+            return None
+
+        artists = [a.strip() for a in track_info['artists'].split(',') if a.strip()]
+        queries = []
+        if artists:
+            artist_part = ' '.join(f'artist:"{a}"' for a in artists[:2])
+            queries.append(f'{artist_part} track:"{track_info["title"]}"')
+        queries.append(f'track:"{track_info["title"]}"')
+        queries.append(f"{track_info['artists']} {track_info['title']}")
+
+        for query in queries:
+            results = sp.search(q=query, type='track', limit=5)
+            items = results.get('tracks', {}).get('items', [])
+            if not items:
+                continue
+
+            candidates = [
+                {
+                    'title': item['name'],
+                    'artists': ', '.join(a['name'] for a in item['artists']),
+                    'url': item['external_urls']['spotify'],
                 }
-            return {
-                'service': self.service['name'],
-            }   
-        except Exception as e:
-            print(f"Error Finding MTS: {e}")
-            return {
-                'url': f'https://music.mts.ru/search?text={track_info['artists']} - {track_info['title']}',
-                'error': str(e),
-                'service': self.service['name'],
+                for item in items
+            ]
+            match = pick_best_match(track_info, candidates)
+            if match:
+                return match['url']
+        return None
+
+    async def find(self, track_info):
+        fallback_url = _spotify_search_url(track_info)
+        try:
+            url = await asyncio.to_thread(self._search_sync, track_info)
+            return {'service': self.service['name'], 'url': url or fallback_url}
+        except Exception:
+            logger.exception('Ошибка поиска в Spotify')
+            return {'service': self.service['name'], 'url': fallback_url}
+
+
+class YandexFinder(Finder):
+    def _search_sync(self, track_info):
+        """Синхронный поиск через Yandex SDK; вызывается через to_thread."""
+        client = get_yandex_client()
+        if client is None:
+            return None
+
+        track_name = f"{track_info['artists']} - {track_info['title']}"
+        result = client.search(track_name, type_='track', page=0)
+
+        candidates = []
+        if result:
+            if result.best and result.best.type == 'track' and result.best.result:
+                candidates.append(result.best.result)
+            if result.tracks and result.tracks.results:
+                candidates.extend(result.tracks.results[:4])
+
+        for track in candidates:
+            candidate = {
+                'title': track.title,
+                'artists': ', '.join(a.name for a in track.artists) if track.artists else '',
             }
+            if is_same_track(track_info, candidate) and track.albums:
+                return (
+                    f'https://music.yandex.ru/album/{track.albums[0].id}/track/{track.id}'
+                )
+        return None
+
+    async def find(self, track_info):
+        fallback_url = _search_url('https://music.yandex.ru/', track_info)
+        try:
+            url = await asyncio.to_thread(self._search_sync, track_info)
+            return {'service': self.service['name'], 'url': url or fallback_url}
+        except Exception:
+            logger.exception('Ошибка поиска в Yandex Music')
+            return {'service': self.service['name'], 'url': fallback_url}
+
+
+class MTSFinder(Finder):
+    async def find(self, track_info):
+        # У MTS Music нет публичного API стабильных ссылок на трек:
+        # VK-поиск отдаёт только прямой mp3-поток, живущий считанные часы,
+        # поэтому всегда отдаём ссылку на страницу поиска
+        return {
+            'service': self.service['name'],
+            'url': _search_url('https://music.mts.ru/', track_info),
+        }
+
 
 class LinkFinder:
     def __init__(self):
-        self.services = SERVICES
-        self.finders = {
-            'Spotify': SpotifyFinder(self.services['Spotify']),
-            'YandexMusic': YandexFinder(self.services['YandexMusic']),
-            'MTS': MTSFinder(self.services['MTS']),
-        }
-        
-    @log_async_method
-    async def find_link(self, track_info):
+        self.finders = [
+            SpotifyFinder(SERVICES['Spotify']),
+            YandexFinder(SERVICES['YandexMusic']),
+            MTSFinder(SERVICES['MTS']),
+        ]
+
+    async def _find_one(self, finder, track_info):
+        """Обёртка-предохранитель: даже если у finder внутренний баг,
+        пользователь получит ссылку на поиск, а не упавший весь ответ."""
         try:
-            results = []
-            for name, finder in self.finders.items():
-                if track_info.get('original_service').get('name') != finder.service["name"]:
-                    result = await finder.find(track_info)
-                    results.append(result)
-            return results
-                
-        except Exception as e:
-            print(f'Error parsing link: {e}')
-            return {'error': 'Failed to parse link'}
-        
-# Для совместимости (асинхронная версия)
+            return await finder.find(track_info)
+        except Exception:
+            logger.exception('Критическая ошибка поиска в %s', finder.service['name'])
+            return {
+                'service': finder.service['name'],
+                'url': _search_url(finder.service['search_base'], track_info),
+            }
+
+    async def find_link(self, track_info):
+        original_name = (track_info.get('original_service') or {}).get('name')
+        tasks = [
+            self._find_one(finder, track_info)
+            for finder in self.finders
+            if finder.service['name'] != original_name
+        ]
+        # Все сервисы ищем параллельно: поодиночке не укладываемся в лимит
+        # serverless-функции
+        return await asyncio.gather(*tasks)
+
+
 async def find_link(track_info):
+    """Ищет трек во всех сервисах, кроме исходного.
+
+    Возвращает список [{'service': str, 'url': str | None}, ...].
+    Каждый finder сам обрабатывает свои ошибки, поэтому исключений
+    наружу не просачивается.
+    """
     finder = LinkFinder()
     return await finder.find_link(track_info)

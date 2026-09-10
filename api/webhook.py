@@ -1,184 +1,146 @@
-import json
-import os
+"""Vercel serverless webhook: принимает апдейты Telegram и обрабатывает их.
+
+Ключевая особенность serverless — «тёплые» вызовы: процесс живёт дольше
+одного HTTP-запроса. Раньше на каждый запрос создавался новый event loop,
+а глобальное приложение Telegram оставалось старым — его httpx-клиент был
+привязан к уже закрытому loop, и со второго запроса бот падал
+«через раз». Теперь loop один на процесс и не закрывается.
+"""
 import asyncio
+import json
+import logging
+import os
+import threading
 from http.server import BaseHTTPRequestHandler
+
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder
+
 from src.message_handler import BotHandlers
 
-# Загружаем переменные окружения
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 TOKEN = os.getenv('TELEGRAM_TOKEN')
+# Секрет из setWebhook: Telegram присылает его в заголовке, всё прочее
+# отбрасываем, чтобы эндпоинт не могли дёргать посторонние
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
+SECRET_HEADER = 'X-Telegram-Bot-Api-Secret-Token'
 
-# Создаем приложение (глобально для переиспользования между вызовами)
-application = None
+_loop = None
+_loop_started = threading.Event()
+_loop_lock = threading.Lock()
+_app = None
+_init_lock = asyncio.Lock()
 
-# Предварительно инициализируем приложение, если токен доступен
-# Примечание: инициализация будет выполнена асинхронно при первом запросе
-if TOKEN:
-    try:
-        print("Pre-creating application...")
-        application = ApplicationBuilder().token(TOKEN).build()
-        handlers = BotHandlers()
-        handlers.setup_handlers(application)
-        
-        # Добавляем обработчик ошибок
-        async def error_handler(update, context):
-            print(f"Update {update} caused error {context.error}")
-            import traceback
-            traceback.print_exc()
-        
-        application.add_error_handler(error_handler)
-        print("Application pre-created successfully (will be initialized on first request)")
-    except Exception as e:
-        print(f"Error pre-creating application: {e}")
-        application = None
 
-def get_application():
-    """Получает или создает приложение Telegram бота"""
-    global application
-    if application is None:
+def _get_loop():
+    """Единственный event loop процесса, живёт в фоновом потоке-драйвере.
+
+    Vercel вызывает handler из обычных синхронных потоков, поэтому loop
+    нельзя взять из контекста — нужен собственный поток, который его крутит.
+    """
+    global _loop
+    if _loop is not None and not _loop.is_closed():
+        return _loop
+    with _loop_lock:
+        if _loop is not None and not _loop.is_closed():
+            return _loop
+        loop = asyncio.new_event_loop()
+        _loop = loop
+        threading.Thread(
+            target=loop.run_forever, name='telegram-bot-loop', daemon=True
+        ).start()
+        # Дожидаемся старта, иначе run_coroutine_threadsafe повиснет
+        while not loop.is_running():
+            pass
+        return loop
+
+
+async def _ensure_app():
+    """Ленивая инициализация приложения Telegram под асинхронным локом."""
+    global _app
+    if _app is not None and _app._initialized:
+        return _app
+    async with _init_lock:
+        if _app is not None and _app._initialized:
+            return _app
         if not TOKEN:
-            print("ERROR: TELEGRAM_TOKEN не найден в переменных окружения")
-            raise ValueError("TELEGRAM_TOKEN не найден в переменных окружения")
-        print(f"Creating application with token: {TOKEN[:10]}...")
-        application = ApplicationBuilder().token(TOKEN).build()
-        handlers = BotHandlers()
-        handlers.setup_handlers(application)
-        
-        # Добавляем обработчик ошибок
-        async def error_handler(update, context):
-            print(f"Update {update} caused error {context.error}")
-            import traceback
-            traceback.print_exc()
-        
-        application.add_error_handler(error_handler)
-        print("Application created successfully")
-    return application
-
-async def process_update_async(update_data):
-    """Асинхронная обработка update"""
-    try:
-        print(f"Processing update: {json.dumps(update_data, indent=2)[:200]}")
-        app = get_application()
-        
-        # Инициализируем приложение, если еще не инициализировано
-        if not app._initialized:
-            print("Initializing application...")
+            raise ValueError('TELEGRAM_TOKEN не найден в переменных окружения')
+        logger.info('Initializing Telegram application')
+        app = ApplicationBuilder().token(TOKEN).build()
+        BotHandlers().setup_handlers(app)
+        try:
             await app.initialize()
-            print("Application initialized")
-        
-        update = Update.de_json(update_data, app.bot)
-        if update:
-            print(f"Update parsed: {update.update_id}")
-            await app.process_update(update)
-            print("Update processed successfully")
-        else:
-            print("Warning: Update is None")
-    except Exception as e:
-        print(f"Error in process_update_async: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+        except Exception:
+            # Не фиксируем полудохлое приложение: следующий запрос
+            # попробует инициализацию заново (токен могли поправить и т.п.)
+            logger.exception('Инициализация приложения не удалась')
+            raise
+        _app = app
+        logger.info('Telegram application initialized')
+    return _app
+
+
+async def _process_update(update_data):
+    app = await _ensure_app()
+    update = Update.de_json(update_data, app.bot)
+    if update is None:
+        logger.warning('Update.de_json вернул None')
+        return
+    logger.info('Processing update %s', update.update_id)
+    await app.process_update(update)
+    logger.info('Update %s processed', update.update_id)
+
+
+def _submit_update(update_data):
+    """Планирует обработку апдейта на постоянном loop и ждёт результата."""
+    loop = _get_loop()
+    future = asyncio.run_coroutine_threadsafe(_process_update(update_data), loop)
+    # 25 c: конвейер ограничен 20 c, остальное — запас на инициализацию
+    return future.result(timeout=25)
+
 
 class handler(BaseHTTPRequestHandler):
     """Обработчик для Vercel serverless function"""
-    
+
     def do_POST(self):
-        """Обрабатывает POST запросы от Telegram"""
+        if WEBHOOK_SECRET and self.headers.get(SECRET_HEADER) != WEBHOOK_SECRET:
+            self._respond(403, {'ok': False, 'error': 'Forbidden'})
+            return
+
         try:
-            print("Received POST request")
-            # Читаем тело запроса
-            content_length = int(self.headers.get('Content-Length', 0))
-            print(f"Content-Length: {content_length}")
-            
-            if content_length == 0:
-                print("Error: Empty body")
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error': 'Empty body'}).encode())
-                return
-                
-            body = self.rfile.read(content_length)
-            print(f"Body received: {len(body)} bytes")
-            
-            try:
-                update_data = json.loads(body.decode('utf-8'))
-            except json.JSONDecodeError as e:
-                print(f"JSON decode error: {e}")
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode())
-                return
-            
-            if not update_data:
-                print("Error: Empty update_data")
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode())
-                return
-            
-            # Обрабатываем update асинхронно
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(process_update_async(update_data))
-                finally:
-                    loop.close()
-            except Exception as e:
-                print(f"Error in async processing: {e}")
-                import traceback
-                traceback.print_exc()
-                # Все равно возвращаем 200, чтобы Telegram не повторял запрос
-            
-            # Отправляем успешный ответ
-            print("Sending 200 OK response")
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            response = json.dumps({'ok': True})
-            self.wfile.write(response.encode())
-            self.wfile.flush()
-            
-        except Exception as e:
-            print(f"Error processing update: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Возвращаем 200, чтобы Telegram не повторял запрос при ошибках обработки
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({'ok': True, 'error': str(e)}).encode())
-    
+            body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            update_data = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            self._respond(400, {'ok': False, 'error': 'Invalid JSON'})
+            return
+
+        try:
+            _submit_update(update_data)
+        except Exception:
+            # Логируем и отвечаем 200: иначе Telegram будет бесконечно
+            # повторять проблемный апдейт
+            logger.exception('Ошибка обработки апдейта')
+            self._respond(200, {'ok': True, 'error': 'processing failed'})
+            return
+
+        self._respond(200, {'ok': True})
+
     def do_GET(self):
-        """Обрабатывает GET запросы (для проверки работоспособности)"""
-        try:
-            print("Received GET request")
-            # Проверяем, что токен установлен
-            if not TOKEN:
-                status = {'status': 'error', 'message': 'TELEGRAM_TOKEN not configured'}
-                status_code = 500
-            else:
-                status = {'status': 'ok', 'service': 'telegram-webhook', 'token_set': True}
-                status_code = 200
-            
-            self.send_response(status_code)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(status).encode())
-        except Exception as e:
-            print(f"Error in GET handler: {e}")
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': str(e)}).encode())
-    
+        """Health-check"""
+        if not TOKEN:
+            self._respond(500, {'status': 'error', 'message': 'TELEGRAM_TOKEN not configured'})
+        else:
+            self._respond(200, {'status': 'ok', 'service': 'telegram-webhook'})
+
+    def _respond(self, status, payload):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode())
+
     def log_message(self, format, *args):
-        """Отключаем стандартное логирование, используем print"""
         pass
